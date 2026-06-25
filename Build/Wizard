@@ -8,3 +8,316 @@
 # License				GPL v3
 #
 # ──────────────────────────────────────────────────────────────────────
+
+exec 3>&2
+exec 2>/dev/null
+
+ERRORS=$(mktemp)
+LOGS=$(mktemp)
+
+# ──────────────────────────────────────────────────────────────────────
+
+trap 'kill -s SIGINT -- -$$' SIGINT
+trap 'kill -s SIGQUIT -- -$$' SIGQUIT
+trap 'kill -s SIGTERM -- -$$' SIGTERM
+
+die ()
+{
+	rm -f $ERRORS
+	rm -f $LOGS
+
+	exec 2>&3
+	exec 3>/dev/null
+}
+
+trap 'die' EXIT
+
+# ──────────────────────────────────────────────────────────────────────
+
+DEBUG=${DEBUG:-0}
+
+compiler=$(command -v clang || command -v gcc)
+linker="$compiler" && ($compiler -fuse-ld=lld -Wl,--version >/dev/null) && linker="$compiler -fuse-ld=lld"
+
+FLAGS="-std=c23 -O2 -flto"
+if [ $DEBUG -eq 1 ]; then FLAGS="-std=c23 -O2 -flto -Wall -Wextra -Wpedantic"; fi
+C="`pkg-config --cflags ImageMagick MagickWand`"
+LD="`pkg-config --libs ImageMagick MagickWand` -Wl,--icf=safe"
+
+# ──────────────────────────────────────────────────────────────────────
+
+already=0
+
+# ──────────────────────────────────────────────────────────────────────
+
+ask ()
+{
+	printf "Are you sure: "
+	read answer
+
+	echo $answer | grep -iq "^yes$"
+
+	if [ $? -ne 0 ]; then
+		echo "no" >"$ERRORS"
+	fi
+
+	printf "[A[2K\r"
+}
+warn ()
+{
+	printf "[33m"
+	printf "$1"
+	printf "[0m"
+
+	echo
+}
+explode ()
+{
+	printf "[31m"
+	printf "$1"
+	printf "[0m"
+
+	echo; exit 1
+}
+
+animate ()
+{
+	trap 'echo "wizard: stopped" > "$ERRORS"; kill -9 $pid' SIGINT SIGQUIT
+
+	while true; do
+		for dots in "" "." ".." "..."; do
+			kill -0 $2 || break 2
+
+			printf "[2K\r$1"
+			printf "$dots"
+			sleep 0.5
+		done
+	done
+}
+verify ()
+{
+	if [ $? -ne 0 ]; then
+		printf "[2K\r[31m✗[0m $1" && echo
+		cat $ERRORS 1>&3
+	elif [ -s $ERRORS ]; then
+		printf "[2K\r[33m⚠[0m $1" && echo
+		cat $ERRORS 1>&3
+	else
+		printf "[2K\r[32m✓[0m $1" && echo
+	fi
+}
+
+# ──────────────────────────────────────────────────────────────────────
+
+cd "$(dirname "$0")"
+
+# ──────────────────────────────────────────────────────────────────────
+
+for argument in "$@"; do
+	case "$argument" in
+		check)
+			# TODO
+			;;
+		build) Wizard compile link pack ;;
+
+		prepare)
+			(
+				mkdir Objects
+				mkdir Objects/Tests
+
+				mkdir Outcomes
+			) 2>$ERRORS &
+			pid=$!
+
+			animate "Preparing" $pid & wait $pid
+			if [ -s $ERRORS ]; then echo "Done already :)" >$ERRORS; fi
+			verify "Prepared"
+			;;
+		compile)
+			(
+				for file in ../Source/*.c; do
+					filename=$(basename "$file" .c)
+					$compiler -c "$file" -o "Objects/$filename.o" \
+						$FLAGS $C
+				done
+				for file in ../Tests/*.c; do
+					filename=$(basename "$file" .c)
+					$compiler -c "$file" -o "Objects/$filename.o" \
+						$FLAGS $C
+				done
+			) 2>$ERRORS &
+
+			pid=$!
+
+			animate "Compiling" $pid & wait $pid
+			verify "Compiled"
+			;;
+		link)
+			$linker Objects/*.o $FLAGS $LD 2>$ERRORS -o Outcomes/Binary &
+			pid=$!
+
+			animate "Linking" $pid & wait $pid
+			verify "Linked"
+			;;
+		pack)
+			(
+				mkdir Outcomes/TMP
+				cp Outcomes/Binary Outcomes/TMP
+				pkgbuild --identifier usr.vorhvb.zone \
+					--root Outcomes/TMP \
+					--min-os-version 10.12 \
+					--install-location /usr/local/bin Outcomes/Installer.pkg >/dev/null
+			) &
+
+			pid=$!
+			animate "Packing" $pid & wait $pid
+			verify "Packed"
+			;;
+
+		analyze)
+			(
+				clang-tidy --header-filter=".*/Source/.*" ../Source/*.c -checks='*' -- \
+					$FLAGS $C -Wall -Wextra -Wpedantic
+				clang-tidy --header-filter=".*/Tests/.*" ../Tests/*.c -checks='*' -- \
+					$FLAGS $C -Wall -Wextra -Wpedantic
+			) >$LOGS &
+			pid=$!
+
+			animate "Analyzing" $pid & wait $pid
+			verify "Analyzed"
+
+			cat $LOGS
+
+			;;
+		test) ;;
+		run)
+			if [ ! -e Outcomes/Binary ]; then explode "Trying to run void... did you run the build?"; fi
+
+			(
+				args=()
+				pass_next=0
+				for arg in "$@"; do
+					if [ "$arg" = "--" ]; then
+						pass_next=1
+					elif [ $pass_next -eq 1 ]; then
+						args+=("$arg")
+						fi
+				done
+				if [ $DEBUG -eq 0 ]; then
+					Outcomes/Binary ${args[@]}
+				else
+					lldb Outcomes/Binary -- ${args[@]}
+				fi
+			) &
+			pid=$!
+
+			animate "Running" $pid & wait $pid
+			verify "Ran"
+
+			;;
+		profile)
+			if [ ! -e Outcomes/Binary ]; then explode "Trying to profile void... did you run the build?"; fi
+
+			(
+				args=()
+				pass_next=0
+				for arg in "$@"; do
+					if [ "$arg" = "--" ]; then
+						pass_next=1
+					elif [ $pass_next -eq 1 ]; then
+						args+=("$arg")
+						fi
+				done
+
+				leaks -atExit -- Outcomes/Binary ${args[@]}
+			) >$LOGS &
+			pid=$!
+
+			animate "Profiling" $pid & wait $pid
+			verify "Profiled"
+
+			cat $LOGS
+
+			;;
+
+		clean)
+			ask
+			rm -Ir Objects 2>>$ERRORS &
+			pid=$!
+
+			animate "Cleaning..." $pid & wait $pid
+
+			if grep -q "^no$" "$ERRORS"; then
+				echo "wizard: rejected" >$ERRORS
+				false
+			else echo "Done already :)" >$ERRORS; fi
+			verify "Clean"
+
+			 ;;
+		scrub)
+			ask
+
+			rm -r Objects
+			rm -r Outcomes || warn "Done already :)"
+
+			;;
+		install)
+			if [ ! -e Outcomes/Binary ]; then explode "Trying to install void... did you run the build?"; fi
+			sudo mv Outcomes/Binary /usr/local/bin/zone || warn "Done already :)"
+			;;
+		uninstall)
+			sudo rm -I /usr/local/bin/zone || already=1
+			if [ -e /usr/local/bin/zone ]; then exit -20; fi
+			if [ $already -eq 1 ]; then warn "Done already :)"; fi
+			;;
+		purge) Wizard uninstall ;;
+
+		dump)
+			tree ..
+
+			cat ../Source/*
+			cat ../Tests/*
+
+			cat Wizard
+
+			;;
+		teach) bear -o ../compile_commands.json -- Wizard ;;
+		edit) zed . || $VISUAL . || $EDITOR . || explode "Sorry, I'm not a telepathist...";;
+
+		help)
+			echo "Wizard"
+			echo "──────"
+			echo "1. check"
+			echo "2. /build"
+			echo
+			echo "3. prepare"
+			echo "4. compile"
+			echo "5. link"
+			echo "6. pack"
+			echo
+			echo "7. analyze"
+			echo "8. test"
+			echo "9. run"
+			echo "10. profile"
+			echo
+			echo "11. clean"
+			echo "12. scrub"
+			echo "13. install"
+			echo "14. uninstall"
+			echo "15. purge"
+			echo
+			echo "16. dump"
+			echo "17. teach"
+			echo "18. edit"
+			echo
+			echo "19. help"
+			echo
+			echo "───────────────────────"
+			echo "Usage: wizard <targets>"
+			;;
+
+		*) explode "Selecting target.. WHAT?!" ;;
+	esac
+done
+
+# ──────────────────────────────────────────────────────────────────────
