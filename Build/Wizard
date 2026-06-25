@@ -8,3 +8,27 @@
 # License				GPL v3
 #
 # ──────────────────────────────────────────────────────────────────────
+
+COMPILER="ccache clang"
+LINKER="clang -fuse-ld=lld"
+
+FLAGS="-std=c23 -O2 -flto"
+C="`pkg-config --cflags ImageMagick MagickWand`"
+LD="`pkg-config --libs ImageMagick MagickWand` -Wl,--icf=safe"
+
+# ──────────────────────────────────────────────────────────────────────
+
+mkdir Build
+mkdir Build/Objects
+
+# ──────────────────────────────────────────────────────────────────────
+
+$COMPILER -c Source/Main.c -o Build/Objects/Main.o \
+		$FLAGS $C
+$COMPILER -c Source/Converter.c -o Build/Objects/Converter.o \
+	$FLAGS $C
+
+$LINKER Build/Objects/*.o -o Build/Zone \
+	$FLAGS $LD
+
+# ──────────────────────────────────────────────────────────────────────
